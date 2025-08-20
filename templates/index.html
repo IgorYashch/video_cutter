@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>VideoCutApp — Quick Cut/Glue</title>
+    <style>
+      body { font-family: -apple-system, system-ui, sans-serif; margin: 2rem; color: #222; }
+      .card { max-width: 860px; padding: 1.5rem; border: 1px solid #e5e5e5; border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.04); }
+      label { display: block; margin: 0.75rem 0 0.35rem; font-weight: 600; }
+      input[type="text"], textarea { width: 100%; padding: 0.6rem 0.75rem; border: 1px solid #ccc; border-radius: 8px; font-size: 0.95rem; }
+      textarea { min-height: 160px; font-family: ui-monospace, Menlo, monospace; }
+      .row { display: flex; gap: 1rem; align-items: center; }
+      .muted { color: #666; font-size: 0.9rem; }
+      .btn { appearance: none; background: #0d6efd; color: #fff; padding: 0.7rem 1.1rem; border-radius: 8px; border: none; font-weight: 600; cursor: pointer; }
+      .btn:hover { background: #0b5ed7; }
+      .alert { background: #fff3cd; color: #664d03; padding: 0.6rem 0.8rem; border: 1px solid #ffecb5; border-radius: 8px; margin-bottom: 0.8rem; }
+      .example { background: #f8f9fa; padding: 0.5rem 0.75rem; border-radius: 6px; font-family: ui-monospace, Menlo, monospace; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h2>VideoCutApp — Quick Cut/Glue</h2>
+      <p class="muted">Upload a video, enter time ranges to keep, and download the result. Fast (copy) or Accurate (re-encode video).</p>
+
+      {% with messages = get_flashed_messages() %}
+        {% if messages %}
+          {% for m in messages %}
+            <div class="alert">{{ m }}</div>
+          {% endfor %}
+        {% endif %}
+      {% endwith %}
+
+      <form method="post" action="/process" enctype="multipart/form-data" id="cutForm">
+        <label for="video">Video file (MP4 recommended)</label>
+        <input type="file" id="video" name="video" accept="video/*">
+        {% if last_file_name %}
+          <div class="muted">Reusing last uploaded file: <strong>{{ last_file_name }}</strong> (leave file empty to reuse)</div>
+        {% endif %}
+
+        <label>Time ranges</label>
+        <div id="rangesContainer"></div>
+        <div class="row" style="margin: 0.5rem 0 0.25rem;">
+          <button class="btn" type="button" id="addRangeBtn">Add Range</button>
+          <button class="btn" type="button" id="clearRangesBtn" style="background:#6c757d;">Clear</button>
+        </div>
+        <div class="muted">Enter times as SS, MM:SS, or HH:MM:SS (decimals allowed). Leave start or end empty for open intervals.</div>
+
+        <!-- Hidden textarea for server compatibility -->
+        <textarea id="rangesText" name="ranges" style="display:none;">{{ ranges or '' }}</textarea>
+
+        <div class="row" style="margin-top: 0.75rem;">
+          <label><input type="checkbox" name="accurate" {% if accurate %}checked{% endif %}> Accurate (slower; re-encode video)</label>
+        </div>
+
+        <label for="out_name">Output filename</label>
+        <input type="text" id="out_name" name="out_name" value="{{ out_name or 'output.mp4' }}" placeholder="output.mp4">
+
+        <div style="margin-top: 1rem;">
+          <button type="submit" class="btn">Process and Download</button>
+        </div>
+      </form>
+
+      <div style="margin-top: 1.2rem;">
+        <div class="example">
+          Example ranges<br>
+          - 00:15:40<br>
+          00:32:00 - 01:10:00<br>
+          1:12:00 -
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const container = document.getElementById('rangesContainer');
+      const rangesText = document.getElementById('rangesText');
+      const addBtn = document.getElementById('addRangeBtn');
+      const clearBtn = document.getElementById('clearRangesBtn');
+      const form = document.getElementById('cutForm');
+
+      function addRow(start = '', end = '') {
+        const row = document.createElement('div');
+        row.className = 'row';
+        row.style.marginTop = '0.35rem';
+        row.innerHTML = `
+          <input type="text" name="start[]" placeholder="Start (e.g., 00:32:00)" value="${start}" />
+          <span>—</span>
+          <input type="text" name="end[]" placeholder="End (e.g., 01:10:00)" value="${end}" />
+          <button type="button" class="btn" style="background:#dc3545;" aria-label="Remove">Remove</button>
+        `;
+        row.querySelector('button').onclick = () => row.remove();
+        const msg = document.createElement('div');
+        msg.className = 'muted';
+        msg.style.color = '#a00';
+        msg.style.fontWeight = '600';
+        msg.style.display = 'none';
+        row.appendChild(msg);
+        const s = row.querySelector('input[name="start[]"]');
+        const e = row.querySelector('input[name="end[]"]');
+        const validate = () => validateRow(row, s, e, msg);
+        s.addEventListener('input', validate);
+        e.addEventListener('input', validate);
+        validate();
+        container.appendChild(row);
+      }
+
+      function syncRangesText() {
+        const starts = Array.from(container.querySelectorAll('input[name="start[]"]')).map(i => i.value.trim());
+        const ends = Array.from(container.querySelectorAll('input[name="end[]"]')).map(i => i.value.trim());
+        const lines = [];
+        for (let i = 0; i < Math.max(starts.length, ends.length); i++) {
+          const s = starts[i] || '';
+          const e = ends[i] || '';
+          if (s === '' && e === '') continue;
+          lines.push(`${s} - ${e}`);
+        }
+        rangesText.value = lines.join('\n');
+      }
+
+      addBtn.onclick = () => addRow('', '');
+      clearBtn.onclick = () => { container.innerHTML = ''; rangesText.value = ''; };
+
+      function parseTime(str) {
+        const t = (str || '').trim();
+        if (!t) return null;
+        if (/^\d+(?:\.\d+)?$/.test(t)) return parseFloat(t);
+        let m = t.match(/^(\d{1,2}):(\d{2})(?:\.(\d+))?$/);
+        if (m) {
+          const mm = parseInt(m[1], 10), ss = parseInt(m[2], 10), frac = m[3] ? parseFloat('0.'+m[3]) : 0;
+          if (ss >= 60) return NaN; return mm*60 + ss + frac;
+        }
+        m = t.match(/^(\d+):(\d{1,2}):(\d{2})(?:\.(\d+))?$/);
+        if (m) {
+          const hh = parseInt(m[1], 10), mm = parseInt(m[2], 10), ss = parseInt(m[3], 10), frac = m[4] ? parseFloat('0.'+m[4]) : 0;
+          if (mm >= 60 || ss >= 60) return NaN; return hh*3600 + mm*60 + ss + frac;
+        }
+        return NaN;
+      }
+
+      function setFieldValidity(input, ok) { input.style.borderColor = ok ? '#ccc' : '#d33'; }
+
+      function validateRow(row, sInput, eInput, msgEl) {
+        const s = parseTime(sInput.value);
+        const e = parseTime(eInput.value);
+        let ok = true, m = '';
+        if (Number.isNaN(s)) { ok = false; m = 'Invalid start time'; }
+        if (Number.isNaN(e)) { ok = false; m = m || 'Invalid end time'; }
+        if (ok && s !== null && e !== null && typeof s === 'number' && typeof e === 'number' && e <= s) { ok = false; m = 'End must be greater than start'; }
+        setFieldValidity(sInput, !(Number.isNaN(s)));
+        setFieldValidity(eInput, !(Number.isNaN(e)));
+        if (!ok) { msgEl.textContent = m; msgEl.style.display = ''; } else { msgEl.textContent=''; msgEl.style.display='none'; }
+        return ok;
+      }
+
+      function validateAll() {
+        const rows = Array.from(container.querySelectorAll('.row'));
+        let ok = true;
+        for (const row of rows) {
+          const s = row.querySelector('input[name="start[]"]');
+          const e = row.querySelector('input[name="end[]"]');
+          const msgEl = row.querySelector('.muted');
+          if (!validateRow(row, s, e, msgEl)) ok = false;
+        }
+        return ok;
+      }
+
+      form.addEventListener('submit', (e) => {
+        if (!validateAll()) { e.preventDefault(); return false; }
+        syncRangesText();
+      });
+
+      // Seed initial example if empty
+      if (!rangesText.value.trim()) {
+        addRow('', '00:15:40');
+        addRow('00:32:00', '01:10:00');
+        addRow('1:12:00', '');
+        syncRangesText();
+      } else {
+        // If server provided ranges text, hydrate rows from it
+        const lines = rangesText.value.split(/\n+/).map(l => l.trim()).filter(Boolean);
+        lines.forEach(l => {
+          const parts = l.split('-');
+          const left = (parts[0] || '').trim();
+          const right = (parts[1] || '').trim();
+          addRow(left, right);
+        });
+      }
+    </script>
+  </body>
+  </html>
